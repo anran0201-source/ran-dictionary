@@ -10,73 +10,94 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing term" });
     }
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a modern English-to-Chinese dictionary for a Chinese speaker learning English. Return only valid JSON with these exact fields: term, pronunciation, phonetic, chinese, explanation, examples.",
-          },
-          {
-            role: "user",
-            content: `Explain this English term: ${term}`,
-          },
-        ],
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "dictionary_entry",
-            strict: true,
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                term: { type: "string" },
-                pronunciation: { type: "string" },
-                phonetic: { type: "string" },
-                chinese: { type: "string" },
-                explanation: { type: "string" },
-                examples: {
-                  type: "array",
-                  items: { type: "string" },
-                },
-              },
-              required: [
-                "term",
-                "pronunciation",
-                "phonetic",
-                "chinese",
-                "explanation",
-                "examples",
-              ],
-            },
-          },
-        },
-      }),
-    });
+    const dictionaryResult = await fetch(
+      `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(term)}`
+    );
 
-    const data = await response.json();
+    let dictionaryData = null;
 
-    if (!response.ok) {
-      console.error("OpenAI API error:", data);
-      return res.status(500).json({ error: "OpenAI API failed" });
+    if (dictionaryResult.ok) {
+      dictionaryData = await dictionaryResult.json();
     }
 
-    const result = JSON.parse(data.choices[0].message.content);
+    const firstEntry = Array.isArray(dictionaryData) ? dictionaryData[0] : null;
+    const phoneticObj =
+      firstEntry?.phonetics?.find((item) => item.text) ||
+      firstEntry?.phonetics?.[0];
 
-    return res.status(200).json(result);
+    const baseDefinition =
+      firstEntry?.meanings?.[0]?.definitions?.[0]?.definition ||
+      "";
+
+    const phonetic = phoneticObj?.text || "IPA unavailable";
+    const pronunciation = phonetic || "Pronunciation unavailable";
+
+    const geminiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: `
+You are a modern English-to-Chinese dictionary for a Chinese speaker learning English.
+
+Term: ${term}
+Free Dictionary definition: ${baseDefinition || "No dictionary definition found"}
+IPA: ${phonetic}
+
+Return ONLY valid JSON with this exact shape:
+{
+  "term": "...",
+  "pronunciation": "...",
+  "phonetic": "...",
+  "chinese": "...",
+  "explanation": "...",
+  "examples": ["...", "...", "..."]
+}
+
+Rules:
+- Use current, natural English.
+- Include modern usage if relevant.
+- Chinese should be Simplified Chinese.
+- Examples should be practical and natural.
+`
+                }
+              ]
+            }
+          ],
+          generationConfig: {
+            responseMimeType: "application/json"
+          }
+        })
+      }
+    );
+
+    const geminiData = await geminiResponse.json();
+
+    if (!geminiResponse.ok) {
+      console.error("Gemini API error:", geminiData);
+      return res.status(500).json({ error: "Gemini API failed" });
+    }
+
+    const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    const aiResult = JSON.parse(text);
+
+    return res.status(200).json({
+      term: aiResult.term || term,
+      pronunciation: aiResult.pronunciation || pronunciation,
+      phonetic: aiResult.phonetic || phonetic,
+      chinese: aiResult.chinese,
+      explanation: aiResult.explanation || baseDefinition,
+      examples: aiResult.examples || []
+    });
   } catch (error) {
     console.error("define-term error:", error);
-
-    return res.status(500).json({
-      error: "Failed to define term",
-    });
+    return res.status(500).json({ error: "Failed to define term" });
   }
 }
