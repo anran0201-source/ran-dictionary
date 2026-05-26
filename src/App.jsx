@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { BookOpen, Download, Plus, Search, Trash2, Volume2, X } from "lucide-react";
+import { supabase } from "./supabaseClient";
+import { BookOpen, Download, Search, Trash2, Volume2, X } from "lucide-react";
+
 function Button({ children, className = "", ...props }) {
   return (
     <button className={className} {...props}>
@@ -8,8 +10,6 @@ function Button({ children, className = "", ...props }) {
     </button>
   );
 }
-
-const STORAGE_KEY = "personal-en-zh-dictionary-v1";
 
 const sampleDictionary = {
   "ai-native": {
@@ -63,14 +63,6 @@ function titleCaseTerm(term) {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function makeStableId(term, count) {
-  const normalized = normalizeTerm(term)
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
-
-  return `${normalized || "term"}-${count + 1}`;
-}
-
 function generateSmartFallback(rawTerm) {
   const term = String(rawTerm || "").trim();
 
@@ -79,11 +71,11 @@ function generateSmartFallback(rawTerm) {
     pronunciation: "Could not fetch pronunciation",
     phonetic: "Could not fetch IPA",
     chinese: "暂时无法生成中文释义",
-    explanation: `I could not connect to the AI lookup service for “${term}”. Check that your /api/define-term endpoint is running and your API key is configured.`,
+    explanation: `I could not connect to the AI lookup service for “${term}”.`,
     examples: [
-      `Try searching “${term}” again after the API endpoint is connected.`,
-      "Your app will automatically save successful searches to Vocabulary.",
-      "Keep your OpenAI API key on the server, not in this React component."
+      `Try searching “${term}” again later.`,
+      "Check that the API endpoint is working.",
+      "Check that the Gemini API key is configured in Vercel."
     ]
   };
 }
@@ -122,25 +114,13 @@ async function lookupTermWithAi(term) {
   return data;
 }
 
-function createVocabularyEntry(result, count) {
-  return {
-    id: makeStableId(result.term, count),
-    term: result.term,
-    explanation: result.explanation,
-    pronunciation: result.pronunciation,
-    phonetic: result.phonetic,
-    chinese: result.chinese
-  };
-}
-
 function entriesMatchFilter(entry, filter) {
   const q = normalizeTerm(filter);
 
-  if (!q) {
-    return true;
-  }
+  if (!q) return true;
 
   return [entry.term, entry.explanation, entry.pronunciation, entry.phonetic, entry.chinese]
+    .filter(Boolean)
     .join(" ")
     .toLowerCase()
     .includes(q);
@@ -166,43 +146,6 @@ function createVocabularyCsv(entries) {
     .join("\n");
 }
 
-function safeLoadEntries() {
-  try {
-    if (typeof window === "undefined") {
-      return [];
-    }
-
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function safeSaveEntries(entries) {
-  try {
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
-    }
-  } catch {
-    // ignore storage errors
-  }
-}
-
-function runDeveloperTests() {
-  console.assert(normalizeTerm(" AI-native ") === "ai-native", "normalizeTerm should trim and lowercase");
-  console.assert(makeStableId("AI-native", 0) === "ai-native-1", "Stable IDs should work");
-  console.assert(entriesMatchFilter(sampleDictionary.integrity, "安全"), "Chinese filtering should work");
-  console.assert(createVocabularyCsv([sampleDictionary.copilot]).includes("Phonetic symbol"), "CSV header should exist");
-  console.assert(generateSmartFallback("agentic").term === "Agentic", "Fallback should title case");
-  console.assert(isValidDictionaryResult(sampleDictionary.copilot), "Sample dictionary entries should match the API response shape");
-  console.assert(!isValidDictionaryResult({ term: "test" }), "Invalid API responses should be rejected");
-}
-
-if (typeof window !== "undefined") {
-  runDeveloperTests();
-}
-
 export default function PersonalDictionaryApp() {
   const [query, setQuery] = useState("");
   const [result, setResult] = useState(null);
@@ -211,26 +154,118 @@ export default function PersonalDictionaryApp() {
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState("search");
 
+  const [user, setUser] = useState(null);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authLoading, setAuthLoading] = useState(true);
+
   useEffect(() => {
-    setEntries(safeLoadEntries());
+    supabase.auth.getUser().then(({ data }) => {
+      setUser(data.user || null);
+      setAuthLoading(false);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+    });
+
+    return () => {
+      listener.subscription.unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
-    safeSaveEntries(entries);
-  }, [entries]);
+    async function loadVocabulary() {
+      if (!user) {
+        setEntries([]);
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("vocabulary")
+        .select("*")
+        .eq("user_id", user.id)
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("Load vocabulary error:", error);
+        return;
+      }
+
+      setEntries(data || []);
+    }
+
+    loadVocabulary();
+  }, [user]);
 
   const filteredEntries = useMemo(() => {
     return entries.filter((entry) => entriesMatchFilter(entry, filter));
   }, [entries, filter]);
 
-  const saveResultToVocabulary = (dictionaryResult) => {
-    setEntries((current) => {
-      const normalized = normalizeTerm(dictionaryResult.term);
-      const withoutDuplicate = current.filter((entry) => normalizeTerm(entry.term) !== normalized);
-      const nextEntry = createVocabularyEntry(dictionaryResult, withoutDuplicate.length);
-
-      return [nextEntry, ...withoutDuplicate];
+  async function signUp() {
+    const { error } = await supabase.auth.signUp({
+      email,
+      password
     });
+
+    if (error) {
+      alert(error.message);
+    } else {
+      alert("Account created. If email confirmation is enabled, please check your inbox.");
+    }
+  }
+
+  async function signIn() {
+    const { error } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (error) {
+      alert(error.message);
+    } else {
+      setEmail("");
+      setPassword("");
+    }
+  }
+
+  async function signOut() {
+    await supabase.auth.signOut();
+    setEntries([]);
+  }
+
+  const saveResultToVocabulary = async (dictionaryResult) => {
+    if (!user) return;
+
+    const row = {
+      user_id: user.id,
+      term: dictionaryResult.term,
+      explanation: dictionaryResult.explanation,
+      pronunciation: dictionaryResult.pronunciation,
+      phonetic: dictionaryResult.phonetic,
+      chinese: dictionaryResult.chinese
+    };
+
+    const { data, error } = await supabase
+      .from("vocabulary")
+      .upsert(row, { onConflict: "user_id,term" })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Save vocabulary error:", error);
+      return;
+    }
+
+    if (data) {
+      setEntries((current) => {
+        const withoutDuplicate = current.filter(
+          (entry) => normalizeTerm(entry.term) !== normalizeTerm(data.term)
+        );
+
+        return [data, ...withoutDuplicate];
+      });
+    }
   };
 
   const handleLookup = async (event) => {
@@ -238,9 +273,7 @@ export default function PersonalDictionaryApp() {
 
     const term = query.trim();
 
-    if (!term) {
-      return;
-    }
+    if (!term) return;
 
     setIsLoading(true);
 
@@ -249,8 +282,9 @@ export default function PersonalDictionaryApp() {
       const found = sampleDictionary[normalized] || (await lookupTermWithAi(term));
 
       setResult(found);
-      saveResultToVocabulary(found);
+      await saveResultToVocabulary(found);
     } catch (error) {
+      console.error(error);
       const fallback = generateSmartFallback(term);
       setResult(fallback);
     } finally {
@@ -258,22 +292,17 @@ export default function PersonalDictionaryApp() {
     }
   };
 
-  const addToVocabulary = () => {
-    if (!result) {
+  const removeEntry = async (id) => {
+    const { error } = await supabase
+      .from("vocabulary")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("Delete vocabulary error:", error);
       return;
     }
 
-    const normalized = normalizeTerm(result.term);
-
-    setEntries((current) => {
-      const withoutDuplicate = current.filter((entry) => normalizeTerm(entry.term) !== normalized);
-      const nextEntry = createVocabularyEntry(result, withoutDuplicate.length);
-
-      return [nextEntry, ...withoutDuplicate];
-    });
-  };
-
-  const removeEntry = (id) => {
     setEntries((current) => current.filter((entry) => entry.id !== id));
   };
 
@@ -283,9 +312,7 @@ export default function PersonalDictionaryApp() {
   };
 
   const speakTerm = (term) => {
-    if (typeof window === "undefined" || !window.speechSynthesis || !term) {
-      return;
-    }
+    if (typeof window === "undefined" || !window.speechSynthesis || !term) return;
 
     const utterance = new SpeechSynthesisUtterance(term);
     utterance.lang = "en-US";
@@ -349,6 +376,63 @@ export default function PersonalDictionaryApp() {
             </div>
           </div>
 
+          {!authLoading && (
+            <div className="mx-auto mt-6 max-w-[780px]">
+              {!user ? (
+                <div className="rounded-[28px] bg-white p-5 shadow-[0_18px_60px_rgba(34,34,34,0.06)]">
+                  <p className="mb-4 text-[15px] font-medium text-[#222222]">
+                    Sign in to sync vocabulary across devices
+                  </p>
+
+                  <div className="flex flex-col gap-3 sm:flex-row">
+                    <input
+                      value={email}
+                      onChange={(event) => setEmail(event.target.value)}
+                      placeholder="Email"
+                      type="email"
+                      className="min-w-0 flex-1 rounded-full bg-[#f7f3f0] px-4 py-3 text-[14px] outline-none placeholder:text-[#aaa39e]"
+                    />
+
+                    <input
+                      value={password}
+                      onChange={(event) => setPassword(event.target.value)}
+                      placeholder="Password"
+                      type="password"
+                      className="min-w-0 flex-1 rounded-full bg-[#f7f3f0] px-4 py-3 text-[14px] outline-none placeholder:text-[#aaa39e]"
+                    />
+
+                    <Button
+                      type="button"
+                      onClick={signIn}
+                      className="rounded-full bg-[#222222] px-5 py-3 text-[14px] font-medium text-white"
+                    >
+                      Sign in
+                    </Button>
+
+                    <Button
+                      type="button"
+                      onClick={signUp}
+                      className="rounded-full bg-[#ff385c] px-5 py-3 text-[14px] font-medium text-white"
+                    >
+                      Sign up
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between rounded-full bg-white px-5 py-3 text-[14px] text-[#8a817c] shadow-[0_12px_40px_rgba(34,34,34,0.05)]">
+                  <span>Signed in as {user.email}</span>
+                  <button
+                    type="button"
+                    onClick={signOut}
+                    className="font-medium text-[#222222]"
+                  >
+                    Sign out
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {page === "search" && (
             <form onSubmit={handleLookup} className="mx-auto mt-8 w-full max-w-[780px]">
               <div className="flex items-center rounded-full bg-white p-2 pl-5 shadow-[0_18px_60px_rgba(34,34,34,0.08)]">
@@ -368,9 +452,9 @@ export default function PersonalDictionaryApp() {
                   className="ml-4 h-12 w-12 rounded-full bg-[#ff385c] p-0 hover:bg-[#e63252] disabled:opacity-60"
                 >
                   {isLoading ? (
-                    <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                    <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
                   ) : (
-                    <Search className="h-5 w-5 text-white" />
+                    <Search className="mx-auto h-5 w-5 text-white" />
                   )}
                 </Button>
               </div>
@@ -450,7 +534,7 @@ export default function PersonalDictionaryApp() {
                       </p>
 
                       <div className="space-y-4">
-                        {result.examples.map((example) => (
+                        {(result.examples || []).map((example) => (
                           <p
                             key={example}
                             className="border-l-2 border-[#ff385c]/40 pl-4 text-[16px] leading-7 text-[#333333]"
@@ -461,8 +545,6 @@ export default function PersonalDictionaryApp() {
                       </div>
                     </section>
                   </div>
-
-                  
                 </motion.article>
               )}
             </AnimatePresence>
@@ -474,17 +556,16 @@ export default function PersonalDictionaryApp() {
                 <h2 className="text-[32px] font-semibold tracking-[-0.04em]">Vocabulary</h2>
 
                 <p className="mt-2 text-[15px] leading-6 text-[#8a817c]">
-                  Review the words you saved from search.
+                  Review the words saved to your account.
                 </p>
               </div>
 
               <Button
                 onClick={exportVocabulary}
                 disabled={!entries.length}
-                variant="ghost"
                 className="w-fit rounded-full px-4 text-[#555555] hover:bg-[#f7f3f0]"
               >
-                <Download className="mr-2 h-4 w-4" />
+                <Download className="mr-2 inline h-4 w-4" />
                 Export CSV
               </Button>
             </div>
@@ -500,7 +581,14 @@ export default function PersonalDictionaryApp() {
               />
             </div>
 
-            {filteredEntries.length === 0 ? (
+            {!user ? (
+              <div className="rounded-[28px] bg-[#faf7f4] p-10 text-center">
+                <p className="text-[17px] font-medium leading-6">Sign in to view synced vocabulary</p>
+                <p className="mt-2 text-[15px] leading-6 text-[#8a817c]">
+                  Your saved words will sync across laptop and phone after you sign in.
+                </p>
+              </div>
+            ) : filteredEntries.length === 0 ? (
               <div className="rounded-[28px] bg-[#faf7f4] p-10 text-center">
                 <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-white text-[#ff385c]">
                   <BookOpen className="h-5 w-5" />
@@ -509,7 +597,7 @@ export default function PersonalDictionaryApp() {
                 <p className="text-[17px] font-medium leading-6">No saved words yet</p>
 
                 <p className="mt-2 text-[15px] leading-6 text-[#8a817c]">
-                  Search a term and save it to build your personal list.
+                  Search a term while signed in to save it automatically.
                 </p>
               </div>
             ) : (
